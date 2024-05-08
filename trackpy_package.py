@@ -5,6 +5,7 @@ import re
 
 import numpy as np
 import pandas as pd
+import scipy as sp
 import trackpy as tp
 import matplotlib.pyplot as plt
 
@@ -16,7 +17,7 @@ class Trial():
     self.batch_df (pd.DataFrame): output of tp.batch
     self.link_df (pd.DataFrame): output of self.link
     '''
-    def __init__(self, frames_dir_path, microns_per_pixel):
+    def __init__(self, frames_dir_path, microns_per_pixel, filter=False, median=False):
         '''
         Args:
             frames_dir_path (os.path): Path to folder containing frames (.bmp) of recording
@@ -56,6 +57,10 @@ class Trial():
 
         # Frames to 3d np array
         self.frames = np.array(frames)
+        if filter:
+            self.frames = sp.ndimage.convolve1d(self.frames, np.array([0.5,0.5]), axis=1)
+
+
         self.microns_per_pixel = microns_per_pixel
 
         # Dataframes (to be initialized with self.batch() and self.link()
@@ -64,12 +69,14 @@ class Trial():
 
     #################### Locating/Tracking Functions ####################
     
-    def locate(self, frame_num, diameter, minmass) -> None:
+    def locate(self, frame_num, diameter, minmass, separation):
         '''
         Helper function to find optimal parameters. Locates and tracks particles in [frame_num] and plots output
         '''
-        f = tp.locate(raw_image=self.frames[frame_num], diameter=diameter, minmass=minmass)
+        f = tp.locate(raw_image=self.frames[frame_num], diameter=diameter, minmass=minmass, separation=separation)
         ax = tp.annotate(f, self.frames[frame_num])
+
+        return ax
             
 
     def batch(self, diameter, output=None, meta=None, processes='auto', after_locate=None, **kwargs) -> None:
@@ -102,10 +109,24 @@ class Trial():
             self.link_df = self.link_df.merge(self.frame_time_df, on='frame', how='inner')
             self.link_df['x'] *= self.microns_per_pixel
             self.link_df['y'] *= self.microns_per_pixel
+
+            
             
         except TypeError as e:
             print("batch_df not initialized! Call self.batch() first!")
 
+    def remove(self, cutoff):
+        '''
+        Removes particles that have less than cutoff frames
+        '''
+        particlecounts = self.link_df.groupby('particle').size()
+        to_remove = particlecounts[particlecounts < cutoff]
+        if len(to_remove.index) > 0:
+            self.link_df = self.link_df[~self.link_df['particle'].isin(to_remove.index)]
+            print(f"Removed {len(to_remove.index)} particles!")
+        else:
+            print("Removed none!")
+        
     def get_particle(self, particle_num) -> pd.DataFrame:
         '''
         Gets trajectory data for particle [particle_num]
@@ -190,7 +211,10 @@ class Trial():
         # Calculate error in measurement
         # Note that our N value is 1 less than the actual number of frames since we are using difference
         err_diff_coeff = dsquared_df['dsquared'].std() / (2 * tau * self.dim * np.sqrt(dsquared_df.index.size))
-        
+
+        # check that not nan
+        if np.isnan(diff_coeff) or np.isnan(err_diff_coeff):
+            return None, None
         
         return (diff_coeff, err_diff_coeff)
 
@@ -198,12 +222,18 @@ class Trial():
         '''
         Calculates diffusion coefficient for all particles
         '''
-        coeffs = []
+        coeffs = np.array([])
+        errs = np.array([])
         particles = self.link_df['particle'].unique()
 
         for p in particles:
-            coeffs.append(self.get_diffusion_coefficient_single(p))
-        return coeffs
+            coeff, err = self.get_diffusion_coefficient_single(p)
+            if coeff is None and err is None:
+                print(f"Particle {p} nan coeff")
+            else:
+                coeffs = np.append(coeffs, coeff)
+                errs = np.append(errs, err)
+        return coeffs, errs
     
     #################### Plotting Functions ####################
     
@@ -219,17 +249,25 @@ class Trial():
 
         plt.plot(x, y)
 
-    def plot_traj(self) -> None:
+    def plot_traj(self, ax=None):
         '''
         Plots trajectories of this sample
         '''
+        if ax is None:
+            fig, ax = plt.subplots()
         try:
             particles = self.link_df['particle'].unique()
             for p in particles:
-                self.plot_traj_single(p)
-            # tp.plot_traj(self.link_df)
+                part_df = self.get_particle(p)
+
+                # Get x and y positions (pixels)                    
+                x = part_df['x']
+                y = part_df['y']
+                
+                ax.plot(x,y)
         except TypeError as e:
             print("link_df not initialized! Call self.link() first!")
+        return ax
 
     def plot_squared_disp_single(self, particle_num) -> None:
         '''
@@ -282,7 +320,7 @@ class Experiment():
     '''
     An experiment is a collection of trials. One experiment folder should contain many trial folders
     '''
-    def __init__(self, experiment_dir_path, microns_per_pixel):
+    def __init__(self, experiment_dir_path, microns_per_pixel, filter=False, median=False):
 
         self.trials = {}
         trial_dirnames = os.listdir(experiment_dir_path)
@@ -290,15 +328,16 @@ class Experiment():
             trial_path = os.path.join(experiment_dir_path, trial_dirname)
             if os.path.isdir(trial_path):
                 self.trials[trial_dirname] = {
-                    'trial': Trial(trial_path, microns_per_pixel),
+                    'trial': Trial(trial_path, microns_per_pixel, filter, median),
                     'diameter': None,
                     'minmass': None,
+                    'separation': None,
                     'search_range': 10
                 }
 
     #################### Locating/Tracking Functions ####################
     
-    def locate(self, trial_name, frame_num, diameter, minmass):
+    def locate(self, trial_name, frame_num, diameter, minmass, separation):
         '''
         Calls locate on specified trial, and sets the parameters stored for the trial to passed in parameters
         '''
@@ -306,11 +345,12 @@ class Experiment():
         trial = self.trials[trial_name]['trial']
 
         # Call locate func
-        trial.locate(frame_num=frame_num, diameter=diameter, minmass=minmass)
+        trial.locate(frame_num=frame_num, diameter=diameter, minmass=minmass, separation=separation)
 
         # Update dict parameters
         self.trials[trial_name]['diameter'] = diameter
         self.trials[trial_name]['minmass'] = minmass
+        self.trials[trial_name]['separation'] = separation
 
     def batch_all(self):
         '''
@@ -322,25 +362,74 @@ class Experiment():
                 print(f"{key} parameters not set!")
                 return
             print(f"Calling batch on {key} with d={val['diameter']}, minmass={val['minmass']}")
-            trial.batch(diameter=val['diameter'], minmass=val['minmass'])
+            trial.batch(diameter=val['diameter'], minmass=val['minmass'], separation=val['separation'])
 
         print("Success!")
 
-    def link_all(self):
+    def link_all(self, range=None):
         '''
         Calls link on all trials
         '''
         for key, val in self.trials.items():
             trial = val['trial']
             print(f"Calling link_df on {key} with search_range={val['search_range']}")
-            trial.link(val['search_range'])
+            if range is None:
+                trial.link(val['search_range'])
+            else:
+                trial.link(range)
 
         print("Success!")
 
-    #################### Plotting Functions ####################
+    def remove(self, cutoff):
+        for key, val in self.trials.items():
+            print(key)
+            val['trial'].remove(cutoff)
+
+    #################### Calculation Functions ####################
     def get_diffusion_coefficient_trial(self, trial_name):
+        '''
+        Get weighted mean and weighted err from trial
+        '''
         trial = self.trials[trial_name]['trial']
-        return trial.get_diffusion_coefficients()
+        coeffs, errs = trial.get_diffusion_coefficients()
+        print(coeffs, errs)
+        if len(coeffs) == 0:
+            print("No particles")
+            return None, None
+        elif len(coeffs) == 1:
+            return coeffs[0], errs[0]
+        else:
+            w = errs**-2
+    
+            weighted_coeff = np.sum(coeffs*w) / np.sum(w)
+            weighted_err = (np.sum(coeffs**2*w)/np.sum(w)-weighted_coeff**2)*len(coeffs)/(len(coeffs)-1)
+    
+            return weighted_coeff, weighted_err
+
+    def get_diffusion_coefficient_experiment(self):
+        '''
+        Get weighted measurement of diff coeff from experiment
+        '''
+        trials = self.trials.keys()
+        coeffs, errs = np.array([]), np.array([])
+
+        # Get measurement for each trial
+        for t in trials:
+            coeff, err = self.get_diffusion_coefficient_trial(t)
+            if coeff is None:
+                print(f"Trial {t} is none")
+            else:
+                coeffs = np.append(coeffs, coeff)
+                errs = np.append(errs, err)
+
+        print(coeffs, errs)
+
+        # Perform weighted averaging
+        w = errs**-2
+        weighted_coeff = np.sum(coeffs*w) / np.sum(w)
+        weighted_err = (np.sum(coeffs**2*w)/np.sum(w)-weighted_coeff**2)*len(coeffs)/(len(coeffs)-1)
+
+        return weighted_coeff, weighted_err
 
     #################### Plotting Functions ####################
     
@@ -349,9 +438,9 @@ class Experiment():
         trial.plot_traj()
 
     def plot_traj_all(self):
+        fig, ax = plt.subplots()
         for key, val in self.trials.items():
             trial = val['trial']
-            trial.plot_traj()
-
-    
+            trial.plot_traj(ax)
+        return ax
     
